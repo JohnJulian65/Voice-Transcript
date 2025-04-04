@@ -3,8 +3,27 @@ import numpy as np
 import scipy.io.wavfile as wav
 import requests
 import datetime
-import time
 import os
+import ssl
+import logging
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+# 🔁 Function added here
+from docx import Document
+def txt_to_docx(input_txt_path, output_docx_path):
+    doc = Document()
+    with open(input_txt_path, "r", encoding="utf-8") as text_file:
+        for line in text_file:
+            doc.add_paragraph(line.strip())
+    doc.save(output_docx_path)
+    print(f"✅ Transcription saved to {output_docx_path}")
+
+# Set up logging
+logging.basicConfig(
+    filename='transcription.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 # Configuration
 GROQ_API_KEY = "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"
@@ -29,22 +48,54 @@ def save_audio(audio_data, sample_rate, filename):
     wav.write(filename, sample_rate, audio_data)
     print(f"Audio segment saved as {filename}")
 
+def create_robust_session():
+    """Create a requests session with retries for older requests versions"""
+    session = requests.Session()
+    
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504, 429],
+        allowed_methods=["POST"]
+    )
+    
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    
+    # For corporate environments, you might need this:
+    session.verify = True  # Keep SSL verification on
+    return session
+
 def transcribe_audio(filename):
-    with open(filename, "rb") as audio_file:
-        files = {"file": (filename, audio_file, "audio/wav")}
-        data = {
-            "model": MODEL,
-            "response_format": "json",
-            "language": "en"  # Change or remove if multilingual
-        }
-        response = requests.post(API_ENDPOINT, headers=HEADERS, files=files, data=data)
-        
-        if response.status_code == 200:  # Make sure this line is indented with spaces, not a tab
-            print("API Response:", response.json())  # This will print the full API response in PowerShell
-            return response.json().get('text', '')
-        else:
-            print("API Error:", response.text)
-            return "[Error in transcription]"
+    try:
+        with open(filename, "rb") as audio_file:
+            files = {"file": (filename, audio_file, "audio/wav")}
+            data = {
+                "model": MODEL,
+                "response_format": "json",
+                "language": "en"
+            }
+            session = create_robust_session()
+            response = session.post(
+                API_ENDPOINT,
+                headers=HEADERS,
+                files=files,
+                data=data,
+                timeout=30
+            )
+            response.raise_for_status()
+            json_data = response.json()
+            print("API Response:", json_data)
+            return json_data.get('text', '')
+    except requests.exceptions.SSLError as ssl_err:
+        print(f"❌ SSL error occurred: {ssl_err}")
+        return "[SSL Error: Transcription failed]"
+    except requests.exceptions.RequestException as req_err:
+        print(f"❌ Request error occurred: {req_err}")
+        return "[Request Error: Transcription failed]"
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+        return "[Unknown Error: Transcription failed]"
 
 def log_transcript(text, logfile):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -66,7 +117,7 @@ def main():
 
             transcript = transcribe_audio(TEMP_AUDIO_FILE)
             log_transcript(transcript, LOG_FILE)
-
+            txt_to_docx(LOG_FILE, "output.docx")
             #cleanup(TEMP_AUDIO_FILE)
 
     except KeyboardInterrupt:
