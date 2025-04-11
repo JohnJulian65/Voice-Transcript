@@ -27,8 +27,9 @@ MODEL = "whisper-large-v3-turbo"
 LOG_FILE = "conversation_log.txt"
 STRUCTURED_LOG_FILE = "structured_conversation_log.txt"
 TEMP_AUDIO_FILE = "temp_audio.wav"
-DURATION = 10  # seconds
+DURATION = 30  # seconds
 SAMPLE_RATE = 16000  # recommended by Groq for optimal performance
+SPEAKER_MEMORY_FILE = "speaker_memory.txt"  # To store identified speakers
 
 HEADERS = {
     "Authorization": f"Bearer {GROQ_API_KEY}"
@@ -38,8 +39,44 @@ HEADERS = {
 ROLES = [
     "chairman", "chairwoman", "chair", "ranking member", "representative",
     "senator", "ambassador", "mr.", "ms.", "mrs.", "dr.", "secretary", 
-    "commissioner", "director", "administrator", "congressman", "congresswoman"
+    "commissioner", "director", "administrator", "congressman", "congresswoman",
+    "subcommittee", "committee"
 ]
+
+# Track current and previous speakers
+current_speaker = None
+previous_speaker = None
+speaker_memory = {}  # Dictionary to store speaker references
+last_speaker_change_time = datetime.datetime.now()
+
+def initialize_speaker_memory():
+    """Initialize or load the speaker memory from file"""
+    global speaker_memory
+    if os.path.exists(SPEAKER_MEMORY_FILE):
+        with open(SPEAKER_MEMORY_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            for line in lines:
+                if ":" in line:
+                    key, value = line.strip().split(":", 1)
+                    speaker_memory[key.strip()] = value.strip()
+    
+    # Initialize with common references
+    default_references = {
+        "chairman": "Committee Chairman",
+        "ranking member": "Ranking Member",
+        "senator from rhode island": "Senator from Rhode Island",
+        "senator cramer": "Senator Cramer"
+    }
+    
+    for key, value in default_references.items():
+        if key not in speaker_memory:
+            speaker_memory[key] = value
+
+def save_speaker_memory():
+    """Save the speaker memory to file"""
+    with open(SPEAKER_MEMORY_FILE, "w", encoding="utf-8") as f:
+        for key, value in speaker_memory.items():
+            f.write(f"{key}: {value}\n")
 
 def record_audio(duration, sample_rate):
     print(f"Recording audio for {duration} seconds...")
@@ -100,36 +137,137 @@ def transcribe_audio(filename):
         print(f"❌ Unexpected error: {e}")
         return "[Unknown Error: Transcription failed]"
 
+def extract_name_reference(text):
+    """Extract references to people in the text"""
+    # Patterns for speaker references
+    reference_patterns = [
+        # Direct introduction
+        r'(?:recognized|recognizes|welcomes|introduces|yield to)\s+(?:the\s+)?(?:distinguished\s+)?((?:gentleman|gentlewoman|senator|representative|ambassador)\s+(?:from\s+\w+(?:\s+\w+)?|(?:\w+\s+)+))',
+        # The senator/representative from [state]
+        r'(?:the\s+)?((?:senator|representative)\s+from\s+(?:\w+\s*)+)',
+        # Specific titles with names
+        r'(?:(?:sub)?committee\s+chair(?:man|woman|person)?\s+(?:\w+\s+)+)',
+        r'(?:ranking\s+member\s+(?:\w+\s+)+)',
+        # Names with titles
+        r'(?:senator|representative|ambassador|secretary|commissioner)\s+(\w+)'
+    ]
+    
+    for pattern in reference_patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        if matches:
+            for match in matches:
+                if isinstance(match, tuple):  # In case there are capturing groups
+                    for m in match:
+                        if m and len(m) > 3:  # Avoid short matches
+                            return m.strip()
+                elif match and len(match) > 3:  # Avoid short matches
+                    return match.strip()
+    
+    return None
+
+def update_speaker_memory(text):
+    """Update the speaker memory based on text analysis"""
+    global speaker_memory, current_speaker, previous_speaker, last_speaker_change_time
+    
+    # Look for introductions or references
+    new_reference = extract_name_reference(text)
+    if new_reference:
+        # Store this reference for future use
+        key = new_reference.lower()
+        if key not in speaker_memory:
+            speaker_memory[key] = new_reference
+            save_speaker_memory()
+            print(f"Added new speaker reference: {new_reference}")
+        
+        # Check if this is a new speaker
+        if not current_speaker or new_reference.lower() != current_speaker.lower():
+            previous_speaker = current_speaker
+            current_speaker = new_reference
+            last_speaker_change_time = datetime.datetime.now()
+            return True, new_reference
+    
+    return False, None
+
 def identify_speaker(text):
     """Identify the speaker from the transcript text"""
-    # Common patterns for speaker identification
-    patterns = [
+    global current_speaker, previous_speaker, last_speaker_change_time
+    
+    # First check for explicit speaker patterns
+    explicit_patterns = [
         # Direct identification patterns: "Chairman Smith:" or "Mr. Johnson says"
-        r'(?:^|\s)((?:' + '|'.join(ROLES) + r')\s+\w+)(?:\s*:|says|\sstated)',
-        # Introduction patterns: "The chair recognizes Representative Smith"
-        r'(?:recognized|recognizes|welcomes|introduces|turning to)\s+((?:' + '|'.join(ROLES) + r')\s+\w+)',
+        r'(?:^|\s)((?:' + '|'.join(ROLES) + r')\s+\w+(?:\s+\w+)*)(?:\s*:|says|\sstated)',
         # Simple name mentions that might be speakers
         r'(?:^|\s)(\w+\s+\w+)(?:\s*:)'
     ]
     
-    for pattern in patterns:
+    for pattern in explicit_patterns:
         matches = re.findall(pattern, text, re.IGNORECASE)
         if matches:
-            # Return the first match, capitalized appropriately
+            # Found an explicit speaker
             speaker = matches[0].strip()
-            # Capitalize role words
-            for role in ROLES:
-                if role in speaker.lower():
-                    pattern = re.compile(re.escape(role), re.IGNORECASE)
-                    speaker = pattern.sub(role.capitalize(), speaker)
-            # Capitalize the name part
-            parts = speaker.split()
-            if len(parts) > 1:
-                speaker = " ".join([parts[0]] + [p.capitalize() for p in parts[1:]])
-            return speaker
+            # Update current speaker if different
+            if not current_speaker or speaker.lower() != current_speaker.lower():
+                previous_speaker = current_speaker
+                current_speaker = speaker
+                last_speaker_change_time = datetime.datetime.now()
+            return format_speaker_name(speaker)
     
-    # Return a default if no speaker is identified
+    # Look for speaker references/introductions
+    is_introduction, new_speaker = update_speaker_memory(text)
+    if is_introduction and new_speaker:
+        return format_speaker_name(new_speaker)
+    
+    # Check for question patterns that might indicate a switch to previous speaker
+    question_indicators = extract_question_answer(text) == "question"
+    if question_indicators and previous_speaker:
+        # If we have a question and a previous speaker, assume they're asking
+        temp = current_speaker
+        current_speaker = previous_speaker
+        previous_speaker = temp
+        last_speaker_change_time = datetime.datetime.now()
+        return format_speaker_name(current_speaker)
+    
+    # If we've had the same speaker for more than 2 segments, consider switching
+    time_since_change = (datetime.datetime.now() - last_speaker_change_time).total_seconds()
+    if time_since_change > DURATION * 2 and previous_speaker:
+        # Assume speaker changed back to previous speaker
+        temp = current_speaker
+        current_speaker = previous_speaker
+        previous_speaker = temp
+        last_speaker_change_time = datetime.datetime.now()
+        return format_speaker_name(current_speaker)
+    
+    # If we have a current speaker, continue with them
+    if current_speaker:
+        return format_speaker_name(current_speaker)
+    
+    # Default fallback
     return "Speaker"
+
+def format_speaker_name(speaker):
+    """Format the speaker name appropriately"""
+    if not speaker:
+        return "Speaker"
+        
+    # Capitalize role words
+    formatted = speaker
+    for role in ROLES:
+        if role in formatted.lower():
+            pattern = re.compile(re.escape(role), re.IGNORECASE)
+            formatted = pattern.sub(role.capitalize(), formatted)
+    
+    # Capitalize proper names
+    words = formatted.split()
+    if len(words) > 1:
+        formatted = " ".join([words[0]] + [w.capitalize() for w in words[1:]])
+    
+    # Check if it matches any stored reference
+    lower_formatted = formatted.lower()
+    for key, value in speaker_memory.items():
+        if key in lower_formatted or lower_formatted in key:
+            return value
+            
+    return formatted
 
 def extract_question_answer(text):
     """Attempt to identify if text is a question or an answer"""
@@ -137,7 +275,7 @@ def extract_question_answer(text):
     question_patterns = [
         r'\?',
         r'^(?:what|how|why|where|when|is|are|do|does|can|could|would|should|will)',
-        r'(?:can you|would you|could you)'
+        r'(?:can you|would you|could you|do you|have you|is there|are there)'
     ]
     
     for pattern in question_patterns:
@@ -150,11 +288,6 @@ def structure_transcript(text):
     """Structure the transcript into speaker sections"""
     # Try to identify speaker
     speaker = identify_speaker(text)
-    q_or_a = extract_question_answer(text)
-    
-    # Format the speaker header
-    if q_or_a == "question" and "Representative" not in speaker and "Chairman" not in speaker and "Member" not in speaker:
-        speaker = f"Representative {speaker}"
     
     # Format the transcript
     formatted_text = f"**{speaker}:** {text}"
@@ -226,7 +359,10 @@ def cleanup(filename):
         print(f"Cleaned up {filename}")
 
 def main():
-    print("🚀 Starting continuous transcription with structure recognition. Press Ctrl+C to stop.")
+    print("🚀 Starting continuous transcription with improved speaker recognition. Press Ctrl+C to stop.")
+    
+    # Initialize speaker memory
+    initialize_speaker_memory()
     
     # Initialize or clear the structured log file
     with open(STRUCTURED_LOG_FILE, "w", encoding="utf-8") as f:
@@ -239,6 +375,10 @@ def main():
 
             # Get raw transcript
             transcript = transcribe_audio(TEMP_AUDIO_FILE)
+            
+            if not transcript or transcript.startswith("["):
+                print("Skipping empty or error transcript")
+                continue
             
             # Log raw transcript (for backup)
             log_transcript(transcript, LOG_FILE)
@@ -257,6 +397,8 @@ def main():
 
     except KeyboardInterrupt:
         print("\n❌ Transcription stopped by user.")
+        # Save speaker memory before exiting
+        save_speaker_memory()
 
 if __name__ == "__main__":
     main()
