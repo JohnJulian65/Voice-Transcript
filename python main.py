@@ -188,6 +188,49 @@ def update_speaker_memory(text):
     
     return False, None
 
+def diarize_with_neural_network(audio_data, sample_rate):
+    """
+    More robust speaker diarization using a neural network approach.
+    This function uses spectral clustering on speaker embeddings.
+    """
+    try:
+        import torch
+        import torchaudio
+        import torch.nn.functional as F
+        from pyannote.audio import Pipeline
+        
+        # Convert numpy array to torch tensor
+        waveform = torch.from_numpy(audio_data).float().div_(32768.0)
+        waveform = waveform.unsqueeze(0)  # Add batch dimension
+        
+        # Initialize the diarization pipeline
+        # Note: You need to download the model first using:
+        # from pyannote.audio import Pipeline; Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token="YOUR_HF_TOKEN")
+        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
+        
+        # Run diarization
+        diarization = pipeline({"waveform": waveform, "sample_rate": sample_rate})
+        
+        # Extract diarization information
+        speakers = {}
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            if speaker not in speakers:
+                speakers[speaker] = []
+            speakers[speaker].append((turn.start, turn.end))
+        
+        # Determine primary speaker for this segment
+        if speakers:
+            # Find speaker with most speaking time
+            max_speaker = max(speakers.items(), key=lambda x: sum(end-start for start, end in x[1]))
+            return max_speaker[0]  # Return speaker ID
+        
+        return None
+    except ImportError:
+        logging.warning("PyAnnote not installed. Falling back to pattern-based diarization.")
+        return None
+    except Exception as e:
+        logging.error(f"Neural diarization error: {e}")
+        return None
 def identify_speaker(text):
     """Identify the speaker from the transcript text"""
     global current_speaker, previous_speaker, last_speaker_change_time
